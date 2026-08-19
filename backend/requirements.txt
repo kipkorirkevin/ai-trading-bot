@@ -1,0 +1,15 @@
+# core
+python-dotenv
+pydantic
+fastapi
+uvicorn
+sqlalchemy
+
+# trading / data
+ccxt
+pandas
+numpy
+websockets
+
+# testing
+pytest
