@@ -10,6 +10,15 @@ Pipeline order matches spec section 2:
     market data -> SMC -> Liquidity -> Fakeout -> Momentum -> Volume ->
     Exhaustion -> MTF -> Regime -> CRT -> AI Brain -> Risk Firewall ->
     Execution -> Trade Manager -> Database
+
+Two trade paths, chosen by market regime (spec section 7):
+    RANGING  -> straddleEngine (two-sided or directional straddle),
+                gated by riskFirewall.check_setup()
+    other    -> AI Brain directional decision,
+                gated by riskFirewall.check()
+If regime is RANGING but straddleEngine finds no valid range (its own
+volatility-ratio thresholds reject it), this falls through to the normal
+AI Brain path rather than forcing a straddle that doesn't actually exist.
 """
 
 import json
@@ -19,7 +28,7 @@ from typing import Optional
 from engines.common import Candle, atr as atr_fn
 from engines import (
     smcEngine, liquidityEngine, momentumEngine, volumeEngine,
-    exhaustionEngine, mtfEngine, fakeoutEngine, regimeEngine, crtEngine,
+    exhaustionEngine, mtfEngine, fakeoutEngine, regimeEngine, crtEngine, straddleEngine,
 )
 from engines.aiBrain import AIBrain, BrainConfig, MarketSnapshot, MarketRegime
 from risk import riskFirewall
@@ -61,6 +70,86 @@ class TradingOrchestrator:
             for c in raw
         ]
 
+    def _account_state(self) -> riskFirewall.AccountState:
+        account = self.broker.get_account_info()
+        return riskFirewall.AccountState(
+            balance=account.balance, equity=account.equity, daily_pnl=0.0,
+            current_drawdown_pct=0.0, open_trade_count=len(self.broker.get_positions()),
+            spread_pips=1.0, max_allowed_spread_pips=3.0,
+        )
+
+    def _try_straddle(self, symbol: str, candles: list, mtf, atr_val: float) -> Optional[dict]:
+        """Returns a result dict if a straddle setup was found and acted on
+        (approved/rejected/executed), or None if there's no valid straddle
+        setup here and the caller should fall through to the AI Brain path."""
+        setup = straddleEngine.analyze(
+            candles, mtf_alignment_score=mtf.alignment_score,
+            mtf_dominant_direction=mtf.dominant_direction, spread_ok=True,
+        )
+        if not setup.valid:
+            return None
+
+        account = self.broker.get_account_info()
+        account_state = self._account_state()
+        risk_result = riskFirewall.check_setup(account_state, self.risk_config, symbol=symbol)
+
+        if risk_result.verdict != riskFirewall.RiskVerdict.APPROVED:
+            return {"status": "REJECTED", "straddle_setup": setup.reasons, "risk": risk_result.summary()}
+
+        extra_buffer = atr_val * 0.2
+        buy_sl = setup.range_low - extra_buffer
+        sell_sl = setup.range_high + extra_buffer
+        buy_risk = setup.buy_trigger - buy_sl
+        sell_risk = sell_sl - setup.sell_trigger
+        tp_mult = self.trade_config.tp_r_multiples[0] if self.trade_config.tp_r_multiples else 1.0
+        buy_tp = setup.buy_trigger + buy_risk * tp_mult
+        sell_tp = setup.sell_trigger - sell_risk * tp_mult
+
+        lot = size_position(
+            self.sizer_config, balance=account.balance,
+            stop_loss_distance=max(buy_risk, sell_risk), pip_value_per_lot=10.0, pip_size=0.0001,
+        )
+
+        would_place = {
+            "setup_type": setup.setup_type, "priority_side": setup.priority_side,
+            "buy_trigger": setup.buy_trigger, "sell_trigger": setup.sell_trigger,
+            "buy_sl": buy_sl, "sell_sl": sell_sl, "buy_tp": buy_tp, "sell_tp": sell_tp, "lot": lot,
+        }
+
+        if not self.config.get("live_trading_enabled", False):
+            return {
+                "status": "APPROVED_NOT_EXECUTED", "straddle_setup": setup.reasons,
+                "risk": risk_result.summary(),
+                "note": "live_trading_enabled is False in config.json — no order sent",
+                "would_place": would_place,
+            }
+
+        if setup.setup_type == "TWO_SIDED":
+            exec_result = executionRouter.execute(
+                self.broker, symbol=symbol, direction="BUY", lot=lot, price=candles[-1].close,
+                sl=None, tp=None, setup_type="STRADDLE",
+                buy_trigger=setup.buy_trigger, sell_trigger=setup.sell_trigger,
+                buy_sl=buy_sl, sell_sl=sell_sl, buy_tp=buy_tp, sell_tp=sell_tp,
+            )
+        else:  # DIRECTIONAL
+            exec_result = executionRouter.execute(
+                self.broker, symbol=symbol, direction=setup.priority_side, lot=lot, price=candles[-1].close,
+                sl=None, tp=None, setup_type="STRADDLE_DIRECTIONAL", directional_side=setup.priority_side,
+                buy_trigger=setup.buy_trigger, sell_trigger=setup.sell_trigger,
+                buy_sl=buy_sl, sell_sl=sell_sl, buy_tp=buy_tp, sell_tp=sell_tp,
+            )
+
+        if not exec_result.success:
+            return {
+                "status": "EXECUTION_BLOCKED", "straddle_setup": setup.reasons,
+                "risk": risk_result.summary(), "rejected_reason": exec_result.rejected_reason,
+            }
+
+        return {
+            "status": "EXECUTED", "straddle_setup": setup.reasons, "risk": risk_result.summary(),
+            "execution": exec_result.detail, "position": would_place,
+        }
+
     def run_cycle(self, symbol: str = None) -> dict:
         symbol = symbol or self.config["symbols"][0]
         candles = self._candles_from_broker(symbol)
@@ -92,6 +181,16 @@ class TradingOrchestrator:
         )
         self._prior_bias = smc.bias
 
+        atr_val = atr_fn(candles, period=14)
+
+        # RANGING regime tries the straddle path first — spec section 7:
+        # "Prefer range/straddle logic and avoid forcing directional trades."
+        if regime.regime == "RANGING":
+            straddle_result = self._try_straddle(symbol, candles, mtf, atr_val)
+            if straddle_result is not None:
+                return straddle_result
+            # else: no valid range found despite RANGING classification — fall through
+
         snapshot = MarketSnapshot(
             symbol=symbol,
             h4_bias=smc.bias, h1_bias=smc.bias, m15_structure=smc.bias,
@@ -115,17 +214,12 @@ class TradingOrchestrator:
         decision = self.brain.evaluate(snapshot)
 
         account = self.broker.get_account_info()
-        account_state = riskFirewall.AccountState(
-            balance=account.balance, equity=account.equity, daily_pnl=0.0,
-            current_drawdown_pct=0.0, open_trade_count=len(self.broker.get_positions()),
-            spread_pips=1.0, max_allowed_spread_pips=3.0,
-        )
+        account_state = self._account_state()
         risk_result = riskFirewall.check(decision, account_state, self.risk_config, symbol=symbol)
 
         if risk_result.verdict != riskFirewall.RiskVerdict.APPROVED:
             return {"status": "REJECTED", "ai_decision": decision.summary(), "risk": risk_result.summary()}
 
-        atr_val = atr_fn(candles, period=14)
         position = tradeManager.set_initial_sl_tp(
             self.trade_config, entry=candles[-1].close, direction=decision.direction.value, atr_value=atr_val,
         )

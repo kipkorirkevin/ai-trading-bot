@@ -89,3 +89,14 @@ git push
   `NotImplementedError` stubs with correct auth schemas — see each file)
 - Database persistence (`database/models.py` schema exists, nothing writes to it yet)
 - Backtesting (`backtest/` still stubs)
+
+## Straddle engine (spec section 5) — now implemented
+
+`engines/straddleEngine.py` detects consolidation ranges (calibrated
+against measured width-to-ATR ratios, not guessed numbers — see the
+module docstring) and produces a TWO_SIDED or DIRECTIONAL straddle setup.
+`main.py` routes RANGING-regime cycles through this path automatically,
+gated by `riskFirewall.check_setup()` and `executionRouter`'s capability
+checks exactly like the AI Brain's directional path — same protections,
+different entry logic. Falls through to the normal AI Brain path if
+straddleEngine finds no valid range despite the RANGING classification.

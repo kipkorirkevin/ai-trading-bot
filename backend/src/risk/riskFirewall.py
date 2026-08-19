@@ -3,12 +3,16 @@ riskFirewall.py — Phase 4 (spec section 15, final authority)
 
 Even if AI Confidence = 95/100, the trade must be rejected here if any hard
 risk condition is violated. Nothing downstream (execution, trade manager)
-may bypass this. This module takes the AI Brain's decision plus live
-account state and returns an explicit APPROVE/BLOCK verdict with the exact
-reason — never a silent pass-through.
+may bypass this. This module takes a trade attempt plus live account state
+and returns an explicit APPROVE/BLOCK verdict with the exact reason —
+never a silent pass-through.
 
-Consumes engines.aiBrain.AIDecision as input so the pipeline is:
-    ... engines ... -> aiBrain.evaluate() -> riskFirewall.check() -> execution
+Two entry points share the same account-gate logic (_gate_reasons):
+    check(decision, account, ...)      — for AI Brain directional decisions
+    check_setup(account, ...)          — for straddle setups, which have no
+                                          single AI direction/confidence to
+                                          gate on but still need every
+                                          account-level protection applied
 """
 
 from dataclasses import dataclass, field
@@ -66,22 +70,10 @@ class RiskCheckResult:
         return "\n".join(lines)
 
 
-def check(
-    decision: AIDecision,
-    account: AccountState,
-    config: Optional[RiskConfig] = None,
-    symbol: str = "",
-) -> RiskCheckResult:
-    config = config or RiskConfig()
+def _gate_reasons(account: AccountState, config: RiskConfig, symbol: str) -> List[str]:
+    """All account-level gates, shared by both directional and straddle
+    trade attempts. Returns an empty list if every gate passes."""
     reasons: List[str] = []
-
-    # A WAIT/NO_TRADE decision from the AI Brain never reaches the firewall
-    # as a trade attempt — but make it explicit and safe if it does.
-    if decision.direction not in (Direction.BUY, Direction.SELL):
-        return RiskCheckResult(
-            verdict=RiskVerdict.BLOCKED,
-            reasons=[f"AI decision was {decision.direction.value}, not a trade signal"],
-        )
 
     daily_loss_pct = (
         (-account.daily_pnl / account.balance) * 100 if account.balance > 0 else 0.0
@@ -124,13 +116,33 @@ def check(
     if account.market_data_stale:
         reasons.append("Market data unreliable/stale — required confirmation missing")
 
+    return reasons
+
+
+def check(
+    decision: AIDecision,
+    account: AccountState,
+    config: Optional[RiskConfig] = None,
+    symbol: str = "",
+) -> RiskCheckResult:
+    config = config or RiskConfig()
+
+    # A WAIT/NO_TRADE decision from the AI Brain never reaches the firewall
+    # as a trade attempt — but make it explicit and safe if it does.
+    if decision.direction not in (Direction.BUY, Direction.SELL):
+        return RiskCheckResult(
+            verdict=RiskVerdict.BLOCKED,
+            reasons=[f"AI decision was {decision.direction.value}, not a trade signal"],
+        )
+
+    reasons = _gate_reasons(account, config, symbol)
     if reasons:
         return RiskCheckResult(verdict=RiskVerdict.BLOCKED, reasons=reasons)
 
     # All gates passed — approve, but the firewall (not the AI) has final
     # say on risk sizing category too, capped by config regardless of what
     # the AI suggested.
-    risk_pct = min(config.max_risk_per_trade_pct, config.max_risk_per_trade_pct)
+    risk_pct = config.max_risk_per_trade_pct
     if decision.suggested_risk_category == "REDUCED":
         risk_pct = risk_pct * 0.5
 
@@ -138,5 +150,34 @@ def check(
         verdict=RiskVerdict.APPROVED,
         reasons=["All risk checks passed"],
         approved_direction=decision.direction,
+        approved_risk_pct=risk_pct,
+    )
+
+
+def check_setup(
+    account: AccountState,
+    config: Optional[RiskConfig] = None,
+    symbol: str = "",
+    risk_category: str = "STANDARD",
+) -> RiskCheckResult:
+    """
+    Same account-level gates as check(), for trade attempts that don't
+    come from a single AI directional decision — currently: straddle
+    setups from straddleEngine.py, which may place two opposing pending
+    orders at once rather than one BUY-or-SELL trade.
+    """
+    config = config or RiskConfig()
+    reasons = _gate_reasons(account, config, symbol)
+    if reasons:
+        return RiskCheckResult(verdict=RiskVerdict.BLOCKED, reasons=reasons)
+
+    risk_pct = config.max_risk_per_trade_pct
+    if risk_category == "REDUCED":
+        risk_pct = risk_pct * 0.5
+
+    return RiskCheckResult(
+        verdict=RiskVerdict.APPROVED,
+        reasons=["All risk checks passed"],
+        approved_direction=None,
         approved_risk_pct=risk_pct,
     )

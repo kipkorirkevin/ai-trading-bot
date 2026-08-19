@@ -7,7 +7,7 @@ import random
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "..", "backend", "src"))
 
 from engines.common import Candle
-from engines import smcEngine, liquidityEngine, momentumEngine, volumeEngine, exhaustionEngine, mtfEngine
+from engines import smcEngine, liquidityEngine, momentumEngine, volumeEngine, exhaustionEngine, mtfEngine, straddleEngine
 from engines.aiBrain import AIBrain, MarketSnapshot, MarketRegime, Direction
 
 
@@ -97,6 +97,60 @@ def test_ai_brain_approves_clean_high_confidence_setup():
     decision = AIBrain().evaluate(snap)
     assert decision.direction == Direction.BUY
     assert decision.confidence >= 75
+
+
+def _ranging_candles(n=60, seed=5):
+    rnd = random.Random(seed)
+    candles, price = [], 1.10000
+    for i in range(n):
+        o = price
+        c = 1.10000 + rnd.uniform(-0.0012, 0.0012)
+        h = max(o, c) + rnd.uniform(0, 0.0002)
+        l = min(o, c) - rnd.uniform(0, 0.0002)
+        candles.append(Candle(timestamp=i, open=o, high=h, low=l, close=c, volume=rnd.uniform(800, 1200)))
+        price = c
+    return candles
+
+
+def test_straddle_detects_range_as_ranging():
+    candles = _ranging_candles()
+    info = straddleEngine.detect_range(candles, lookback=20)
+    assert info.is_ranging is True
+
+
+def test_straddle_rejects_trending_market():
+    candles = _trending_candles(drift=0.0009)
+    result = straddleEngine.analyze(candles, mtf_alignment_score=90, mtf_dominant_direction="BUY")
+    assert result.valid is False
+    assert result.setup_type == "NONE"
+
+
+def test_straddle_two_sided_on_weak_alignment():
+    candles = _ranging_candles()
+    result = straddleEngine.analyze(candles, mtf_alignment_score=40, mtf_dominant_direction="BUY")
+    assert result.valid is True
+    assert result.setup_type == "TWO_SIDED"
+    assert result.priority_side is None
+    assert result.sell_trigger < result.buy_trigger
+
+
+def test_straddle_directional_on_strong_alignment():
+    candles = _ranging_candles()
+    result = straddleEngine.analyze(candles, mtf_alignment_score=80, mtf_dominant_direction="SELL")
+    assert result.valid is True
+    assert result.setup_type == "DIRECTIONAL"
+    assert result.priority_side == "SELL"
+
+
+def test_straddle_rejects_abnormal_spread():
+    candles = _ranging_candles()
+    result = straddleEngine.analyze(candles, mtf_alignment_score=80, mtf_dominant_direction="BUY", spread_ok=False)
+    assert result.valid is False
+
+
+def test_straddle_opposite_side_helper():
+    assert straddleEngine.opposite_side("BUY") == "SELL"
+    assert straddleEngine.opposite_side("SELL") == "BUY"
 
 
 if __name__ == "__main__":
