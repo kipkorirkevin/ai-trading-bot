@@ -9,6 +9,7 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "..", "backend"
 from engines.common import Candle
 from engines import smcEngine, liquidityEngine, momentumEngine, volumeEngine, exhaustionEngine, mtfEngine, straddleEngine
 from engines.aiBrain import AIBrain, MarketSnapshot, MarketRegime, Direction
+from data import dataValidator
 
 
 def _trending_candles(n=120, seed=1, drift=0.0006):
@@ -151,6 +152,67 @@ def test_straddle_rejects_abnormal_spread():
 def test_straddle_opposite_side_helper():
     assert straddleEngine.opposite_side("BUY") == "SELL"
     assert straddleEngine.opposite_side("SELL") == "BUY"
+
+
+def test_data_validator_accepts_fresh_valid_candles():
+    import time
+    now = time.time()
+    candles = [
+        Candle(timestamp=now - 900 * (10 - i), open=1.1, high=1.101, low=1.099, close=1.1005, volume=1000)
+        for i in range(10)
+    ]
+    result = dataValidator.validate(candles, timeframe="M15", now=now)
+    assert result.is_valid is True
+    assert result.is_stale is False
+
+
+def test_data_validator_flags_stale_data():
+    import time
+    now = time.time()
+    candles = [
+        Candle(timestamp=now - 900 * (10 - i) - 10000, open=1.1, high=1.101, low=1.099, close=1.1005, volume=1000)
+        for i in range(10)
+    ]
+    result = dataValidator.validate(candles, timeframe="M15", now=now)
+    assert result.is_valid is False
+    assert result.is_stale is True
+
+
+def test_data_validator_flags_invalid_ohlc():
+    import time
+    now = time.time()
+    candles = [
+        Candle(timestamp=now - 900 * (5 - i), open=1.1, high=1.05, low=1.15, close=1.1, volume=1000)
+        for i in range(5)
+    ]
+    result = dataValidator.validate(candles, timeframe="M15", now=now)
+    assert result.is_valid is False
+    assert result.invalid_ohlc_count == 5
+
+
+def test_market_data_engine_caches_within_ttl():
+    from brokers.mockAdapter import MockBrokerAdapter
+    from data.marketData import MarketDataEngine
+
+    broker = MockBrokerAdapter()
+    broker.connect({})
+    engine = MarketDataEngine(broker, cache_ttl_seconds=60.0)
+
+    r1 = engine.get_candles("EURUSD", "M15", limit=30)
+    r2 = engine.get_candles("EURUSD", "M15", limit=30)
+    assert r1.from_cache is False
+    assert r2.from_cache is True
+
+
+def test_market_data_engine_fresh_mock_data_passes_validation():
+    from brokers.mockAdapter import MockBrokerAdapter
+    from data.marketData import MarketDataEngine
+
+    broker = MockBrokerAdapter()
+    broker.connect({})
+    engine = MarketDataEngine(broker)
+    result = engine.get_candles("EURUSD", "M15", limit=50)
+    assert result.validation.is_valid is True
 
 
 if __name__ == "__main__":

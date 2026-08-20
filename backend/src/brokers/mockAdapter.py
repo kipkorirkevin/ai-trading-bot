@@ -8,6 +8,7 @@ everything else needs real broker testing first (see baseAdapter.py docstring).
 
 import itertools
 import random
+import time
 from typing import Any, Dict, List, Optional
 
 from .baseAdapter import (
@@ -89,7 +90,18 @@ class MockBrokerAdapter(BaseBrokerAdapter):
         spread = 0.00012
         return {"bid": base, "ask": base + spread}
 
+    # Kept in sync with engines.common.TIMEFRAME_SECONDS — duplicated here
+    # rather than imported to avoid brokers/ depending on engines/ for a
+    # single dict; if you add a timeframe to one, add it to the other.
+    _TIMEFRAME_SECONDS = {"M1": 60, "M5": 300, "M15": 900, "M30": 1800, "H1": 3600, "H4": 14400}
+
     def get_market_data(self, symbol: str, timeframe: str, limit: int = 200) -> List[Dict[str, float]]:
+        interval = self._TIMEFRAME_SECONDS.get(timeframe, 900)
+        now = int(time.time())
+        # Anchor the most recent candle to "now" (minus one interval, since
+        # the current candle is still forming) so staleness checks behave
+        # sanely — a real broker's most recent closed candle is never from
+        # epoch 1970, and this shouldn't be either.
         candles = []
         price = 1.10000
         for i in range(limit):
@@ -98,7 +110,8 @@ class MockBrokerAdapter(BaseBrokerAdapter):
             h = max(o, c) + self._rnd.uniform(0, 0.0004)
             l = min(o, c) - self._rnd.uniform(0, 0.0003)
             vol = self._rnd.uniform(700, 1300)
-            candles.append({"timestamp": i, "open": o, "high": h, "low": l, "close": c, "volume": vol})
+            timestamp = now - (limit - i) * interval
+            candles.append({"timestamp": timestamp, "open": o, "high": h, "low": l, "close": c, "volume": vol})
             price = c
         return candles
 

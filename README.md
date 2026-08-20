@@ -100,3 +100,26 @@ gated by `riskFirewall.check_setup()` and `executionRouter`'s capability
 checks exactly like the AI Brain's directional path — same protections,
 different entry logic. Falls through to the normal AI Brain path if
 straddleEngine finds no valid range despite the RANGING classification.
+
+## Market Data Engine (spec section 2/31) — now implemented
+
+`data/marketData.py` is a broker-agnostic layer over any `BaseBrokerAdapter`:
+multi-timeframe fetching in one call, short-TTL caching, and every fetch
+run through `data/dataValidator.py` (gap/duplicate/invalid-OHLC/staleness
+checks). This closes a real gap: `riskFirewall.AccountState.market_data_stale`
+previously was hardcoded `False` in `main.py` and never actually connected
+to anything — now a stale or corrupt candle series blocks a trade before
+the engines even run, regardless of AI confidence or `live_trading_enabled`
+(see `tests/4_mock_broker_integration/test_stale_market_data_blocks_trade_even_with_trivial_confidence_bar`).
+
+`data/websocketManager.py` is a generic reconnect/backoff/heartbeat state
+machine (spec section 31) — broker-agnostic, no Deriv/MT5-specific code.
+Any future adapter with a persistent connection wraps this instead of
+reimplementing exponential backoff from scratch.
+
+Honest limitation: `MockBrokerAdapter` still generates synthetic candles
+underneath this layer — there's no real live feed until a real broker
+adapter (Deriv or MT5) is implemented and plugged in. This is the
+infrastructure that becomes live the moment that happens; it was built
+now because it exercises the exact same interface a real adapter will
+use, and the stale-data protection is real today even with mock data.

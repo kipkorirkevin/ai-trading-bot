@@ -21,6 +21,15 @@ class Candle:
     volume: float = 0.0
 
 
+# Shared across brokers/ and data/ so "M15" means the same 900 seconds
+# everywhere — mockAdapter uses this to generate realistic timestamps,
+# marketData.py uses it for staleness/gap checks.
+TIMEFRAME_SECONDS = {
+    "M1": 60, "M5": 300, "M15": 900, "M30": 1800,
+    "H1": 3600, "H4": 14400, "D1": 86400,
+}
+
+
 def true_range(prev: Candle, cur: Candle) -> float:
     return max(
         cur.high - cur.low,

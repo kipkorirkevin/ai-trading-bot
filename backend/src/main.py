@@ -36,6 +36,7 @@ from risk.positionSizer import PositionSizerConfig, calculate as size_position
 from trading import tradeManager, executionRouter
 from brokers.baseAdapter import BaseBrokerAdapter
 from brokers.mockAdapter import MockBrokerAdapter
+from data.marketData import MarketDataEngine
 
 CONFIG_PATH = Path(__file__).parent / "config" / "config.json"
 
@@ -57,25 +58,26 @@ class TradingOrchestrator:
         self.risk_config = riskFirewall.RiskConfig(**self.config["risk"])
         self.sizer_config = PositionSizerConfig(**self.config["position_sizer"])
         self.trade_config = tradeManager.TradeManagerConfig(**self.config["trade_management"])
+        self.market_data = MarketDataEngine(self.broker)
 
         self._prior_bias = "NEUTRAL"
+        self._last_data_issues: list = []   # populated each run_cycle, read by _account_state
 
     def _candles_from_broker(self, symbol: str, timeframe: str = "M15", limit: int = 120) -> list:
-        raw = self.broker.get_market_data(symbol, timeframe, limit)
-        return [
-            Candle(
-                timestamp=c["timestamp"], open=c["open"], high=c["high"],
-                low=c["low"], close=c["close"], volume=c.get("volume", 0.0),
-            )
-            for c in raw
-        ]
+        """Thin wrapper kept for callers that just want candles without
+        caring about validation (e.g. ad-hoc scripts/tests). run_cycle()
+        itself uses self.market_data directly so it can see validation
+        results and feed them into the Risk Firewall."""
+        result = self.market_data.get_candles(symbol, timeframe, limit, run_validation=False)
+        return result.candles
 
-    def _account_state(self) -> riskFirewall.AccountState:
+    def _account_state(self, data_stale: bool = False) -> riskFirewall.AccountState:
         account = self.broker.get_account_info()
         return riskFirewall.AccountState(
             balance=account.balance, equity=account.equity, daily_pnl=0.0,
             current_drawdown_pct=0.0, open_trade_count=len(self.broker.get_positions()),
             spread_pips=1.0, max_allowed_spread_pips=3.0,
+            market_data_stale=data_stale,
         )
 
     def _try_straddle(self, symbol: str, candles: list, mtf, atr_val: float) -> Optional[dict]:
@@ -90,7 +92,7 @@ class TradingOrchestrator:
             return None
 
         account = self.broker.get_account_info()
-        account_state = self._account_state()
+        account_state = self._account_state(data_stale=bool(self._last_data_issues))
         risk_result = riskFirewall.check_setup(account_state, self.risk_config, symbol=symbol)
 
         if risk_result.verdict != riskFirewall.RiskVerdict.APPROVED:
@@ -152,7 +154,20 @@ class TradingOrchestrator:
 
     def run_cycle(self, symbol: str = None) -> dict:
         symbol = symbol or self.config["symbols"][0]
-        candles = self._candles_from_broker(symbol)
+
+        fetch = self.market_data.get_candles(symbol, "M15", limit=120, run_validation=True)
+        candles = fetch.candles
+        self._last_data_issues = [] if fetch.validation.is_valid else fetch.validation.issues
+
+        if not fetch.validation.is_valid:
+            # Market data unreliable/stale — spec section 15 explicit block
+            # condition. Don't even bother running the engines on bad data.
+            account_state = self._account_state(data_stale=True)
+            blocked = riskFirewall.RiskCheckResult(
+                verdict=riskFirewall.RiskVerdict.BLOCKED,
+                reasons=["Market data validation failed: " + "; ".join(fetch.validation.issues)],
+            )
+            return {"status": "REJECTED", "ai_decision": None, "risk": blocked.summary()}
 
         smc = smcEngine.analyze(candles)
         liquidity = liquidityEngine.analyze(candles)
@@ -214,7 +229,7 @@ class TradingOrchestrator:
         decision = self.brain.evaluate(snapshot)
 
         account = self.broker.get_account_info()
-        account_state = self._account_state()
+        account_state = self._account_state(data_stale=bool(self._last_data_issues))
         risk_result = riskFirewall.check(decision, account_state, self.risk_config, symbol=symbol)
 
         if risk_result.verdict != riskFirewall.RiskVerdict.APPROVED:
