@@ -1,1 +1,15 @@
-{ "name": "ai-trading-bot", "displayName": "AI Trading Bot" }
+{
+  "expo": {
+    "name": "AI Trading Bot",
+    "slug": "ai-trading-bot",
+    "version": "1.0.0",
+    "orientation": "portrait",
+    "userInterfaceStyle": "automatic",
+    "android": {
+      "package": "com.kipkorirkevin.aitradingbot",
+      "adaptiveIcon": {
+        "backgroundColor": "#0b0f14"
+      }
+    }
+  }
+}
